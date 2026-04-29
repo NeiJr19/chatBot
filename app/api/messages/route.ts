@@ -1,30 +1,50 @@
 import { NextRequest, NextResponse } from 'next/server';
 import OpenAI from 'openai';
 import db from '@/lib/db';
+import {
+  semanticSearch,
+  getProcessesByIds,
+  processToText,
+  extractJjoIds,
+} from '@/lib/search';
 import { randomUUID } from 'crypto';
 
 const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-type ProcessRow = {
-  id: string;
-  origin_country: string;
-  destination_country: string;
-  product: string;
-  status: string;
-  estimated_arrival: string;
-};
+async function buildRagContext(query: string): Promise<string> {
+  try {
+    const explicitIds = extractJjoIds(query);
+    const explicit = getProcessesByIds(explicitIds);
+    const explicitSet = new Set(explicit.map((p) => p.id));
 
-function buildProcessesContext(): string {
-  const rows = db
-    .prepare('SELECT * FROM processes ORDER BY rowid ASC')
-    .all() as ProcessRow[];
+    const semantic = await semanticSearch(query, 8);
+    const semanticOnly = semantic.filter((p) => !explicitSet.has(p.id));
 
-  const lines = rows.map(
-    (p) =>
-      `${p.id} | ${p.origin_country} → ${p.destination_country} | ${p.product} | ${p.status} | Chegada: ${p.estimated_arrival}`
-  );
+    const lines: string[] = [];
 
-  return `\n\nBase de dados atual dos processos JJO da ComexPro:\n${lines.join('\n')}`;
+    if (explicit.length > 0) {
+      lines.push('Processos mencionados explicitamente pelo usuário:');
+      for (const p of explicit) lines.push(`  ${processToText(p)}`);
+    }
+
+    if (semanticOnly.length > 0) {
+      lines.push('Processos relacionados (busca semântica por similaridade):');
+      for (const p of semanticOnly) {
+        lines.push(`  ${processToText(p)} [relevância: ${p.score.toFixed(2)}]`);
+      }
+    }
+
+    if (lines.length === 0) return '';
+
+    console.log(
+      `[RAG] explicit=${explicit.length} semantic=${semanticOnly.length} top_score=${semantic[0]?.score.toFixed(3) ?? 'n/a'}`
+    );
+
+    return '\n\n--- CONTEXTO RAG ---\n' + lines.join('\n');
+  } catch (err) {
+    console.error('[RAG] Failed to build context:', err);
+    return '';
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -58,15 +78,19 @@ export async function POST(req: NextRequest) {
     )
     .all(conversationId) as { role: string; content: string }[];
 
+  const ragContext = await buildRagContext(message);
+
   const systemPrompt =
     'Você é o assistente virtual da ComexPro, empresa especializada em comércio exterior. ' +
     'Ajude os usuários com dúvidas sobre importação, exportação, despacho aduaneiro, classificação NCM, ' +
     'regimes especiais (drawback, RECOF, entreposto), câmbio, documentação (LI, DI, RE, DDE), ' +
     'RADAR, SISCOMEX e legislação aduaneira brasileira. ' +
-    'Você também tem acesso em tempo real aos processos JJO da empresa listados abaixo. ' +
-    'Quando perguntado sobre um processo específico ou sobre a lista, use esses dados para responder com precisão. ' +
+    'Você tem acesso a uma seleção dos processos JJO mais relevantes para cada consulta, recuperados ' +
+    'por busca semântica e por match exato de código. Use APENAS os processos listados no contexto RAG ' +
+    'para responder perguntas sobre processos específicos. Se um processo não aparecer no contexto, ' +
+    'informe que não foi encontrado entre os processos relevantes. ' +
     'Seja claro, objetivo e profissional. Responda sempre em português.' +
-    buildProcessesContext();
+    ragContext;
 
   const stream = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
